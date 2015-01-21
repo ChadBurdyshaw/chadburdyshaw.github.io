@@ -1,0 +1,196 @@
+---
+title: "PracticalMachineLearningProject"
+author: "Chad Burdyshaw"
+date: "Monday, January 19, 2015"
+output: html_document
+---
+
+##Background
+
+The purpose of this project is to build a machine learning model which can predict quality of exercise from a set of body position sensor data.
+
+##Data set description: 
+Six individuals performed dumbell curls in a set of 10 repetitions using five different forms:
+exactly according to the specification (Class A), 
+throwing the elbows to the front (Class B), 
+lifting the dumbbell only halfway (Class C), 
+lowering the dumbbell only halfway (Class D) 
+and throwing the hips to the front (Class E).
+
+Data was captured for each individual using around 2000 time windows of 0.5 to 2.5 seconds each with 0.5 second overlap.
+For each time window data was captured from four sensors located on the waist, arm, forearm, and dumbell.
+Each sensor recorded nine position values: magnetometer(x,y,z), gyros(x,y,z), and accelerometer(x,y,z). From these values, three Euler angles were computed for each sensor: (Roll, Pitch, Yaw). And from each of the Euler angles, the summary variables (mean, variance, standard deviation, max, min, amplitude, kurtosis, skewness) were computed.
+
+The goal of this project is to predict the manner in which they did the exercise on an unlabeled test set. 
+
+##Data 
+
+The training data for this project are available here:    
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here: 
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project come from this source: 
+http://groupware.les.inf.puc-rio.br/har
+(see the section on the Weight Lifting Exercise Dataset). 
+
+Read more: http://groupware.les.inf.puc-rio.br/har#dataset#ixzz3OwL6mER0
+
+```{r libraries,message=FALSE,echo=FALSE,warning=FALSE}
+#include necessary libraries
+library(caret)
+library(cvTools)
+library(e1071)
+library(randomForest)
+```
+##input data
+
+```{r training_data}
+#training set
+pml_data<-read.csv("pml-training.csv")
+```
+
+There are no labels in this testing set
+```{r prediction_data}
+#finaltest set has problem_id in place of classe
+finaltest<-read.csv("pml-testing.csv")
+```
+
+##Exploratory analysis and cleaning of the data set
+
+The summary vars should be removed (they don't make sense as they are recorded in this dataset, and are not included in the test dataframe)
+```{r clean_summary_vars}
+summary_var_names<-c("avg_","var_","stddev_","max_","min_","amplitude_","skewness_","kurtosis_")
+summary_vars<-c()
+for(name in summary_var_names){
+    summary_vars<-c(summary_vars,grep(name,names(pml_data)))
+}
+pml_data=pml_data[,-summary_vars]
+```
+
+###Check for low variance variables
+
+We will check for any remaining low variance variables and remove them.
+```{r remove_low_variance_factors}
+lowVarianceFactors<-nearZeroVar(pml_data)
+#names(pml_data)[lowVarianceFactors]
+pml_data <- pml_data[,-lowVarianceFactors]
+```
+
+When creating a predictive model we want to remove variables which correlate to specific segments of the data set and are not predictive in the general population. Variables such as: X, username, window variables and the timestamp variables, some of which are unique to a username.
+
+```{r remove_non_predictive_vars}
+non_predictive_vars <- c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_2","cvtd_timestamp","num_window")
+#remove high bias variables from training set
+pml_data<-pml_data[,-which( names(pml_data) %in% non_predictive_vars)]
+#get column index of dependent variable "classe""
+depvar=which( names(pml_data) %in% c("classe"))
+```
+
+##Model building
+
+Although the data contains several time series, let's initially assume that temporal information is unimportant.
+
+We'll begin by randomly splitting the data set into training and testing set
+
+```{r split_data_set}
+set.seed(144)
+trainIndex = createDataPartition(pml_data$classe, p = 0.70,list=FALSE)
+training = pml_data[trainIndex,]
+testing = pml_data[-trainIndex,]
+```
+
+###Random forest model
+
+We have several choices for classification models e.g.: CART, Random Forest, and SVM.
+Since Random Forest is just an ensemble of CART models, we might as well start with that.
+
+```{r create_rf_model,cache=TRUE}
+set.seed(144)
+RF_model = randomForest(classe ~., data = training,method="class",importance=TRUE)
+OOB <- RF_model$err.rate[500]*100
+```
+
+###Important factors
+
+The important factors determined by the random forest model can be found by measuring the mean decrease in accuracy as factors are added to the trees.
+```{r important_factors_accuracy}
+#what are the important factors? using mean decrease in accuracy
+important_vars=importance(RF_model,type=1)
+head(important_vars[order(important_vars,decreasing=TRUE),])
+```
+
+Another method for determining important factors is by measuring the mean decrease in node impurity as factors are added to trees.
+```{r important_factors_Gini}
+#what are the important factors? Using Gini, mean decrease in node impurity
+Gini_important_vars=importance(RF_model,type=2)
+head(Gini_important_vars[order(Gini_important_vars,decreasing=TRUE),])
+```
+The top six factors are yaw_belt, roll_belt, pitch_belt, magnet_dumbell_z, pitch_forearm, and magnet_dumbell_y.
+
+##Out of sample error estimation
+
+The Random Forest model uses bagging to choose sample data from the training set. The out of bag (OOB) samples not chosen to create each tree can be used as a test set for that tree. This OOB error should be a conservative estimate for the out of sample error. For our RF model the OOB=`r OOB`%.
+
+###Cross validation
+For purposes of comparison, we can calculate the out of sample error using a k-fold cross validation with k=10. 
+
+This cross validation varies the number of factors/features in the model while testing on k held out test samples of size n/k.
+```{r cross_validate_RF_model,cache=TRUE}
+RF_model_cv=rfcv(training[,-depvar],training[,depvar],cv.fold=10)
+```
+
+A plot of the classification error on the held out test sets vs. the number of variables in the model shows that we can still get a pretty accurate model using only around one fifth of the variables. But since the data set isn't too large, and the aggregate bootstrapping of the model reduces the chances of overfitting, we will keep the most accurate model using all of the variables. 
+
+```{r CV_plot,echo=FALSE}
+with(RF_model_cv, plot(n.var, error.cv, log="x", type="o", lwd=2,main="CV plot of error vs. num variables in the model (max 53)."))
+```
+
+```{r CV_OOS}
+OOS <-RF_model_cv$error.cv[1]*100
+```
+The out of sample (OOS) error computed for the k-fold cross validation =`r OOS`%. This is slightly less than the conservative OOB estimate from the random forest model. 
+
+
+##Evaluating the performance of the model on the test set
+
+The random forest model was applied to predicting the held out test set.
+```{r predict_rf_model,cache=TRUE}
+RF_model_pred=predict(RF_model,newdata=testing,type='response')
+```
+
+```{r confusion_matrix}
+#confusion matrix
+RF_conf_mat=confusionMatrix(RF_model_pred,testing$classe)
+RF_accuracy <- RF_conf_mat$overall[1]*100
+RF_conf_mat$table
+```
+The confusion matrix of the model prediction on testing data shows the actual out of sample accuracy is `r  RF_accuracy`%.
+
+```{r OOS_error}
+#actual out of sample classification accuracy
+RFoutOfSampleAccuracy <- sum(RF_model_pred == testing$classe)/length(RF_model_pred)
+#actual out of sample classification error
+RFoutOfSampleError <- (1-RFoutOfSampleAccuracy)*100
+```
+The actual testing set out of sample error =`r RFoutOfSampleError`%.
+
+Despite not using any time dependency in our model, the prediction accuracy is quite high. 
+
+##Output prediction to separate files
+```{r output_files}
+#Make final test set predictions and output to files
+Best_model <- RF_model
+Best_model_pred <- as.character(predict(Best_model,finaltest))
+# print data to files
+pml_write_files = function(x) {
+    n = length(x)
+    for (i in 1:n) {
+        filename = paste0(".\\Predictions\\problem_id_", i, ".txt")
+        write.table(x[i], file = filename, quote = FALSE, row.names = FALSE, col.names = FALSE)
+    }
+}
+
+pml_write_files(Best_model_pred)
+```
